@@ -1,0 +1,10 @@
+.venv*/
+__pycache__/
+*.pyc
+*.log
+*.log.*
+recordings/
+数据/
+test_artifacts/
+studio_config.json
+*.zip
