@@ -52,19 +52,19 @@ class Window(W.QMainWindow):
     def build_plots(self,*unused):
         old=self.scroll.takeWidget()
         if old: old.deleteLater()
-        content=W.QWidget(); lay=W.QVBoxLayout(content); lay.setContentsMargins(0,0,6,0); lay.setSpacing(5)
+        content=W.QWidget(); lay=W.QVBoxLayout(content); lay.setContentsMargins(0,0,0,0); lay.setSpacing(3)
         self.curves=[]; self.plots=[]; self.channel_labels=[]; self.guides=[]; self.kind=16 if self.group.currentIndex()==0 else 17
         for i,name in enumerate(NAMES[self.kind]):
             frame=W.QWidget(); row=W.QHBoxLayout(frame); row.setContentsMargins(3,0,3,0)
-            label=W.QLabel(name); label.setFixedWidth(126); label.setStyleSheet('color:'+COLORS[i]); row.addWidget(label)
-            plot=pg.PlotWidget(); plot.setMinimumHeight(145); plot.setMaximumHeight(145); plot.setMenuEnabled(False); plot.setMouseEnabled(x=False,y=False); plot.hideButtons(); plot.hideAxis('bottom'); plot.hideAxis('left')
+            label=W.QLabel(name); label.setFixedWidth(126); label.setStyleSheet('font-size:9pt;color:'+COLORS[i]); label.setSizePolicy(W.QSizePolicy.Fixed,W.QSizePolicy.Ignored); row.addWidget(label)
+            plot=pg.PlotWidget(); plot.setMinimumHeight(32); plot.setSizePolicy(W.QSizePolicy.Expanding,W.QSizePolicy.Ignored); plot.setMenuEnabled(False); plot.setMouseEnabled(x=False,y=False); plot.hideButtons(); plot.hideAxis('bottom'); plot.hideAxis('left')
             guides=[]
             for j in range(6):
                 line=pg.InfiniteLine(angle=90,pen=pg.mkPen('#24384d')); plot.addItem(line); guides.append(line)
             plot.addItem(pg.InfiniteLine(pos=0,angle=0,pen=pg.mkPen('#344b63'))); self.guides.append(guides)
             curve=plot.plot(pen=pg.mkPen(COLORS[i],width=1),connect='finite'); curve.setClipToView(True); curve.setDownsampling(auto=True,method='peak')
-            row.addWidget(plot,1); lay.addWidget(frame); self.curves.append(curve); self.plots.append(plot); self.channel_labels.append(label)
-        lay.addStretch(); self.scroll.setWidget(content)
+            row.addWidget(plot,1); lay.addWidget(frame,1); self.curves.append(curve); self.plots.append(plot); self.channel_labels.append(label)
+        self.scroll.setWidget(content)
     def start_engine(self,source,replay=None):
         self.engine=Engine(port=self.config['port'],rates={16:self.config['emg'],17:self.config['imu']},source=source,replay=replay); self.engine.start(); self.freeze.setChecked(False)
     def change_source(self,source,replay=None):
@@ -156,7 +156,7 @@ class Window(W.QMainWindow):
             for j,line in enumerate(self.guides[c]): line.setPos(-span+span*j/5)
             stale=time.monotonic()-self.engine.last_by_kind[self.kind]>2
             flag='无新数据' if stale else '平线 · 检查接触' if np.ptp(finite)==0 else '接近 int16 边界' if np.any(np.abs(finite)>=32760) else ''
-            label.setText(f'{NAMES[self.kind][c]}\n范围 {int(finite.min())}…{int(finite.max())}\n'+('显示已去直流\n' if self.center.isChecked() else '')+flag)
+            label.setText(f'{NAMES[self.kind][c]}'+(' · '+flag if flag else '')+f'\n{int(finite.min())}…{int(finite.max())}'); label.setToolTip('原始值范围；各通道独立自动缩放。'+('显示已去直流。' if self.center.isChecked() else '')+flag)
     def closeEvent(self,event):
         self.guide.finish('application_closed')
         if not self.closing:
