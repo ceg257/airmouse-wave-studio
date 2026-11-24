@@ -32,6 +32,7 @@ class Window(W.QMainWindow):
         self.transition=None; self.closing=False; self.frame_times=[]; self.last_stats=0.; self.last_error=0.; self.render_errors=0
         self.labels=[]; self.label_info={}; self._label_end=0.; self._label_static=False; self._label_dirty=False
         self._selected_label_index=None; self._syncing_table=False; self._edit_guard=False; self._paused_before_edit=False
+        self._scrub_guard=False
         self._flash_text=''; self._flash_until=0.
         explicit=getattr(args,'replay',None); demo=getattr(args,'demo',False)
         # Auto-restore the previous replay workspace, but never override explicit launch flags.
@@ -134,6 +135,14 @@ class Window(W.QMainWindow):
         self.label_tip.setStyleSheet('color:#8fa5bf'); self.label_tip.setSizePolicy(W.QSizePolicy.Ignored,W.QSizePolicy.Preferred); self.label_tip.setMinimumWidth(0)
         row.addWidget(self.label_tip)
         box.addLayout(row)
+        # 回放定位：拖到任意时刻；点标签表格的行也会跳转（见 _on_label_selection）
+        scrub_row=W.QHBoxLayout(); self.scrub_caption=W.QLabel('定位'); self.scrub_caption.setStyleSheet('color:#8fa5bf')
+        self.scrub=W.QSlider(QtCore.Qt.Horizontal); self.scrub.setRange(0,1000); self.scrub.setEnabled(False)
+        self.scrub.setToolTip('拖动定位到任意时刻；点表格某一行跳到该动作')
+        self.scrub.valueChanged.connect(self._on_scrub)
+        self.scrub_pos=W.QLabel('0.0 / 0.0 s'); self.scrub_pos.setStyleSheet('color:#8fa5bf')
+        scrub_row.addWidget(self.scrub_caption); scrub_row.addWidget(self.scrub,1); scrub_row.addWidget(self.scrub_pos)
+        box.addLayout(scrub_row)
         self.labelbar.setVisible(False); self.label_panel.setVisible(False)
     def _load_labels(self,folder):
         self._label_dirty=False; self._selected_label_index=None
@@ -231,6 +240,9 @@ class Window(W.QMainWindow):
         if self._syncing_table: return
         self._selected_label_index=self.table.currentRow() if self.table.currentRow()>=0 else None
         if not self._label_static: self._sync_labels(self._label_end,float(self.span.currentText()))
+        index=self._selected_label_index
+        if index is not None and index<len(self.labels) and not self.edit_labels.isChecked():
+            self._jump_to(self.labels[index])
     def _on_label_item_changed(self,cell):
         if self._syncing_table or cell.column()!=4: return
         row=cell.row()
@@ -292,7 +304,9 @@ class Window(W.QMainWindow):
                 self.table.setEditTriggers(W.QAbstractItemView.NoEditTriggers)
                 if not self._paused_before_edit:
                     self.pause_replay.setChecked(False)
-                    if self.engine: self.engine.pause.clear()
+                    if self.engine:
+                        self.engine.follow_latest()
+                        self.engine.pause.clear()
                 self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
         finally: self._edit_guard=False
     def _freeze_labels_for_edit(self):
@@ -312,8 +326,55 @@ class Window(W.QMainWindow):
                     try: self.pause_replay.setChecked(True)
                     finally: self._edit_guard=False
                     self.flash('编辑标签时回放保持暂停；先取消“编辑标签”再继续回放'); return
+                engine.follow_latest()      # 继续回放时回到流位置
                 engine.pause.clear()
         self.flash('回放已暂停：时间轴静止，可编辑标签' if checked else '回放继续')
+    def _replay_bounds(self):
+        engine=getattr(self,'engine',None)
+        if not engine or getattr(engine,'source',None)!='REPLAY': return None
+        return engine.bounds()
+
+    def _update_scrub_text(self):
+        b=self._replay_bounds()
+        if not b:
+            self.scrub.setEnabled(False); self.scrub_pos.setText('—'); return
+        lo,hi=b; dur=max(hi-lo,1e-6)
+        pos=self.engine.view_end if self.engine.view_end is not None else hi
+        self.scrub.setEnabled(True)
+        self._scrub_guard=True
+        try: self.scrub.setValue(int(round((pos-lo)/dur*1000)))
+        finally: self._scrub_guard=False
+        self.scrub_pos.setText(f'{pos-lo:.1f} / {dur:.1f} s')
+
+    def _on_scrub(self,value):
+        if self._scrub_guard: return
+        b=self._replay_bounds()
+        if not b: return
+        lo,hi=b; self._scrub_guard=True
+        try:
+            if not self.pause_replay.isChecked(): self.pause_replay.setChecked(True)
+            self.engine.seek(lo+(hi-lo)*value/1000.0)
+            self.render_frame()
+            self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
+        except Exception: LOG.exception('scrub failed')
+        finally: self._scrub_guard=False
+        self._update_scrub_text()
+
+    def _jump_to(self,item):
+        b=self._replay_bounds()
+        if not b: return
+        lo,hi=b; span=float(self.span.currentText())
+        mid=(float(item['start'])+float(item['end']))/2.0
+        target=min(max(mid+span/2.0,lo),hi)     # 让区间落在视窗中间
+        self._scrub_guard=True
+        try:
+            if not self.pause_replay.isChecked(): self.pause_replay.setChecked(True)
+            self.engine.seek(target); self.render_frame()
+            self._sync_labels(self._label_end,span,force=True)
+        except Exception: LOG.exception('jump failed'); return
+        finally: self._scrub_guard=False
+        self._update_scrub_text(); self.flash(f"已定位：{item['label']} @ {mid:.2f}s")
+
     def save_label_edits(self):
         if not self.labelbar.isVisible(): self.flash('只有回放视图有标签可保存'); return
         folder=getattr(self.engine,'replay',None)
@@ -454,7 +515,10 @@ class Window(W.QMainWindow):
                 paused_replay=e.source=='REPLAY' and self.pause_replay.isChecked()
                 self.info.setText(f'{e.status}{" · 已暂停" if paused_replay else ""}  |  EMG {counts[16]:,} · {rates[16]:.0f} 点/s    IMU {counts[17]:,} · {rates[17]:.0f} 点/s  |  协议异常 {errors}  时间调整 {adjust}（非丢包计数）')
                 span=float(self.span.currentText())
-                if not self.freeze.isChecked(): self.ruler.setText('距最新数据：  '+'     │     '.join(f'−{span*(1-i/5):g}s' if i<5 else '最新' for i in range(6))+f'      显示时刻 {e.latest:.2f}s')
+                pos=e.view_end if e.view_end is not None else e.latest
+                lead='距最新数据' if e.view_end is None else '窗口（定位中）'
+                if not self.freeze.isChecked(): self.ruler.setText(lead+'：  '+'     │     '.join(f'−{span*(1-i/5):g}s' if i<5 else '最新' for i in range(6))+f'      显示时刻 {pos:.2f}s')
+                self._update_scrub_text()
                 saving=any(w.thread.is_alive() for w in e.writers) and not rec
                 self.record.setText('■ 结束并保存' if rec else '正在落盘…' if saving else '● 开始保存')
                 self.record.setEnabled(bool(rec) or (not saving and e.source!='REPLAY' and e.connected and age<2))

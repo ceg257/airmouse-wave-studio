@@ -98,6 +98,11 @@ class Engine:
         self.latest = 0.; self.segment = 0; self.anchor = None; self.offset = 0.; self.prev = {}; self.ends = {}
         self.adjustments = 0; self.bad = 0; self.discontinuities = 0; self.recorder = None; self.writers = []
         self.events = deque(maxlen=80); self.label = None; self.record_fault = None
+        # 回放定位：流式块会被裁剪，所以回放额外留一份全量历史；view_end 为 None 表示跟随最新
+        self.retain = (source == 'REPLAY')
+        self.history = {16: deque(), 17: deque()}; self.history_samples = {16: 0, 17: 0}
+        self.history_cap = 1_500_000          # 每组通道最多保留的样本数（500 Hz 约 50 分钟）
+        self.view_end = None
     def message(self, text):
         self.events.append((time.strftime('%H:%M:%S'), text)); LOG.info(text)
     def start(self):
@@ -130,6 +135,11 @@ class Engine:
             self.prev[kind]=stamp; self.ends[kind]=float(times[-1]); self.latest=max(self.latest,float(times[-1]))
             self.blocks[kind].append((times, values, self.segment, gap))
             while self.blocks[kind] and (self.blocks[kind][0][0][-1]<self.latest-32 or len(self.blocks[kind])>3000): self.blocks[kind].popleft()
+            if self.retain:
+                # 回放额外留一份全量（供拖动定位），有上限；超限退化为流式
+                self.history[kind].append((times, values, self.segment, gap)); self.history_samples[kind]+=len(values)
+                while self.history[kind] and self.history_samples[kind]>self.history_cap:
+                    old=self.history[kind].popleft(); self.history_samples[kind]-=len(old[1])
             self.counts[kind]+=len(values); self.last_receive=now; self.last_by_kind[kind]=now
             self.recent[kind].append((now,len(values)))
             while self.recent[kind] and self.recent[kind][0][0]<now-3: self.recent[kind].popleft()
@@ -139,8 +149,9 @@ class Engine:
                     self.record_fault=self.recorder.error; self.message('保存失败：'+self.record_fault); self.end_record()
     def snapshot(self, span=5, kind=16):
         with self.lock:
-            end=self.latest
-            blocks=[b for b in self.blocks[kind] if b[0][-1]>=end-span]
+            end=self.latest if self.view_end is None else self.view_end
+            source=self.history[kind] if (self.retain and self.history[kind]) else self.blocks[kind]
+            blocks=[b for b in source if b[0][-1]>=end-span and b[0][0]<=end]
         if not blocks: return np.empty(0),np.empty((0,len(NAMES[kind]))),end
         tt=[]; vv=[]; previous=None
         for t,v,seg,gap in blocks:
@@ -148,8 +159,24 @@ class Engine:
                 tt.append(np.array([t[0]-1e-9])); vv.append(np.full((1,v.shape[1]),np.nan))
             tt.append(t); vv.append(v); previous=seg
         x=np.concatenate(tt); y=np.concatenate(vv).astype(float,copy=False)
-        take=x>=end-span
+        take=(x>=end-span)&(x<=end)
         return x[take],y[take],end
+    def bounds(self):
+        """回放可定位区间 (最早, 最新)；非回放或还没数据时返回 None。"""
+        with self.lock:
+            if not self.retain: return None
+            lo=min((h[0][0][0] for h in self.history.values() if h),default=None)
+            hi=max((h[-1][0][-1] for h in self.history.values() if h),default=None)
+        return (float(lo),float(hi)) if lo is not None and hi is not None else None
+    def seek(self, seconds):
+        """把显示位置钉在某一时刻（绝对时间轴）；返回实际位置，失败返回 None。"""
+        b=self.bounds()
+        if not b: return None
+        lo,hi=b; t=min(max(float(seconds),lo),hi)
+        with self.lock: self.view_end=t
+        return t
+    def follow_latest(self):
+        with self.lock: self.view_end=None
     def start_record(self, root, subject):
         with self.lock:
             if self.recorder: return
