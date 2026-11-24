@@ -92,7 +92,7 @@ class Recorder:
 class Engine:
     def __init__(self, port=9002, rates=None, source='RK_TCP', replay=None):
         self.port = port; self.rates = rates or {16:500,17:200}; self.source = source; self.replay = replay
-        self.lock = threading.RLock(); self.stop = threading.Event(); self.thread = None
+        self.lock = threading.RLock(); self.stop = threading.Event(); self.pause = threading.Event(); self.thread = None
         self.blocks = {16:deque(),17:deque()}; self.counts = {16:0,17:0}; self.recent = {16:deque(),17:deque()}
         self.status = '准备连接'; self.connected = False; self.last_receive = 0.; self.last_by_kind={16:0.,17:0.}
         self.latest = 0.; self.segment = 0; self.anchor = None; self.offset = 0.; self.prev = {}; self.ends = {}
@@ -199,7 +199,11 @@ class Engine:
             except OSError as exc:
                 self.status=f'端口 {self.port} 不可用：{exc}'; self.message(self.status); self.stop.wait(2)
     def demo(self):
-        from demo_signal import simulated_imu
+        # demo_signal.py 是拆分版（github 仓库里有）；本地老副本从 engine.py 取同一个函数
+        try:
+            from demo_signal import simulated_imu
+        except ImportError:
+            from engine import simulated_imu
         import random
         rng=random.Random(42); start=time.monotonic(); counters={16:0,17:0}
         self.new_segment(); self.connected=True; self.status='模拟数据 · 不可用于训练'
@@ -229,10 +233,17 @@ class Engine:
                 it=iter(groups(Path(self.replay)/(name+'.csv'),k)); first=next(it,None)
                 if first: heapq.heappush(heap,(first[0],k,first,it))
             if not heap: raise ValueError('记录没有数据')
-            origin=heap[0][0]; start=time.monotonic(); self.new_segment(); self.connected=True; self.status='历史数据回放 · 非实时设备'; last_seg=None
+            origin=heap[0][0]; start=time.monotonic(); paused=0.; self.new_segment(); self.connected=True; self.status='历史数据回放 · 非实时设备'; last_seg=None
             while heap and not self.stop.is_set():
+                if self.pause.is_set():
+                    # Hold the display clock still so the plot (and label editing) is stable.
+                    begin=time.monotonic()
+                    while self.pause.is_set() and not self.stop.is_set(): time.sleep(.02)
+                    paused+=time.monotonic()-begin
+                    if self.stop.is_set(): break
+                    continue
                 host,k,item,it=heapq.heappop(heap)
-                if self.stop.wait(max(0,host-origin-(time.monotonic()-start))): break
+                if self.stop.wait(max(0,host-origin-(time.monotonic()-start-paused))): break
                 if last_seg is not None and item[3]!=last_seg: self.new_segment()
                 last_seg=item[3]; self.receive(k,item[1],item[2])
                 nxt=next(it,None)
@@ -240,4 +251,3 @@ class Engine:
             self.status='回放已结束'
         finally:
             for f in handles: f.close()
-

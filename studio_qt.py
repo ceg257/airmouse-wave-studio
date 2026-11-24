@@ -1,5 +1,5 @@
 """Wave Studio 3: Qt/PyQtGraph UI; raw acquisition runs independently."""
-import argparse, json, logging, sys, time
+import argparse, json, logging, os, subprocess, sys, time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import numpy as np
@@ -7,10 +7,20 @@ from PySide6 import QtCore, QtGui, QtWidgets as W
 import pyqtgraph as pg
 from wave_core import Engine, NAMES
 from guided_capture import Guide
+import replay_labels
 ROOT=Path(__file__).resolve().parent
 COLORS=['#48d9ba','#6aafff','#eac267','#df8bbb','#ac9cef','#8bd39b','#ff9982','#6ed5e9','#d9ce8e']
+MAX_LABEL_SPANS=16
 LOG=logging.getLogger('wave')
 pg.setConfigOptions(antialias=False,background='#101c2d',foreground='#9caec5')
+
+def settings_path():
+    """Workspace memory location. WAVE_STUDIO_SETTINGS overrides it (tests/portable use)."""
+    override=os.environ.get('WAVE_STUDIO_SETTINGS')
+    if override: return Path(override)
+    base=os.environ.get('APPDATA')
+    home=Path(base) if base else Path.home()/'AppData'/'Roaming'
+    return home/'AirMouseWaveStudio'/'last_session.json'
 
 class Window(W.QMainWindow):
     def __init__(self,args):
@@ -20,8 +30,27 @@ class Window(W.QMainWindow):
         except (OSError,ValueError): pass
         if args.port is not None: self.config['port']=args.port
         self.transition=None; self.closing=False; self.frame_times=[]; self.last_stats=0.; self.last_error=0.; self.render_errors=0
-        self.setStyleSheet('QMainWindow,QDialog{background:#0b1422;color:#deebf7;} QWidget{background:#0b1422;font-family:Microsoft YaHei UI;font-size:10pt;} QLabel{color:#deebf7;} QPushButton,QComboBox,QLineEdit,QSpinBox{background:#1c2c42;color:#e1edf9;border:1px solid #344b64;border-radius:5px;padding:7px;} QPushButton:hover{background:#2a405b;} QPushButton:disabled{color:#6f8094;background:#152235;} QPushButton#record{background:#136c60;} QCheckBox{color:#cad9e9;} QScrollArea{border:0;} QMenu{background:#1c2c42;color:#e1edf9;} QMenu::item:selected{background:#365675;}')
-        base=W.QWidget(); self.setCentralWidget(base); layout=W.QVBoxLayout(base); layout.setContentsMargins(20,14,20,10); layout.setSpacing(12)
+        self.labels=[]; self.label_info={}; self._label_end=0.; self._label_static=False; self._label_dirty=False
+        self._selected_label_index=None; self._syncing_table=False; self._edit_guard=False; self._paused_before_edit=False
+        self._flash_text=''; self._flash_until=0.
+        explicit=getattr(args,'replay',None); demo=getattr(args,'demo',False)
+        # Auto-restore the previous replay workspace, but never override explicit launch flags.
+        self._allow_persist_write=(os.environ.get('QT_QPA_PLATFORM')!='offscreen'
+                                   or bool(os.environ.get('WAVE_STUDIO_SETTINGS'))) and not getattr(args,'compare',False)
+        self.persist=not getattr(args,'compare',False)
+        saved=self._load_session() if self.persist else {}
+        self.restore=explicit; self._restore_note=''
+        if not explicit and not demo and self.persist and saved.get('replay'):
+            candidate=Path(saved['replay'])
+            if candidate.is_dir() and (candidate/'metadata.json').is_file():
+                self.restore=str(candidate)
+                seen=saved.get('last_timeline')
+                self._restore_note=f'已恢复上次回放：{candidate.name}'+(f'（上次看到 {seen:.1f}s，本次从头回放）' if isinstance(seen,(int,float)) else '')
+            else:
+                self._restore_note='上次回放目录已不存在，已回到等待设备；可在“设置与文件”里重新打开'
+                self._forget_session()
+        self.setStyleSheet('QMainWindow,QDialog{background:#0b1422;color:#deebf7;} QWidget{background:#0b1422;font-family:Microsoft YaHei UI;font-size:10pt;} QLabel{color:#deebf7;} QPushButton,QComboBox,QLineEdit,QSpinBox{background:#1c2c42;color:#e1edf9;border:1px solid #344b64;border-radius:5px;padding:7px;} QPushButton:hover{background:#2a405b;} QPushButton:disabled{color:#6f8094;background:#152235;} QPushButton#record{background:#136c60;} QCheckBox{color:#cad9e9;} QScrollArea{border:0;} QMenu{background:#1c2c42;color:#e1edf9;} QMenu::item:selected{background:#365675;} QTableWidget{background:#0f1b2b;color:#deebf7;gridline-color:#22364c;border:1px solid #22364c;} QHeaderView::section{background:#16253a;color:#9fc0dc;border:0;padding:3px;}')
+        base=W.QWidget(); self.setCentralWidget(base); layout=W.QVBoxLayout(base); layout.setContentsMargins(20,14,20,10); layout.setSpacing(10)
         header=W.QHBoxLayout(); title=W.QLabel('AIR MOUSE  /  WAVE STUDIO'); title.setStyleSheet('font-size:19pt;font-weight:700;color:#53d9c0'); header.addWidget(title); header.addStretch()
         self.badge=W.QLabel('准备连接'); header.addWidget(self.badge); layout.addLayout(header)
         hint=W.QLabel('打开即等待开发板  ·  接收、绘图与文件保存独立运行'); hint.setStyleSheet('color:#8fa5bf'); layout.addWidget(hint)
@@ -31,29 +60,293 @@ class Window(W.QMainWindow):
         self.freeze=W.QPushButton('暂停显示'); self.freeze.setCheckable(True); self.freeze.toggled.connect(lambda v:self.freeze.setText('继续显示' if v else '暂停显示')); tools.addWidget(self.freeze); tools.addStretch()
         self.more=W.QPushButton('设置与文件 ▾'); menu=W.QMenu(self)
         menu.addAction('连接与保存设置…',self.settings); menu.addAction('打开数据目录',self.open_folder)
-        menu.addSeparator(); menu.addAction('打开历史记录回放…',self.open_replay); menu.addAction('回到真实设备',lambda:self.change_source('RK_TCP')); menu.addAction('模拟演示',lambda:self.change_source('SIMULATED'))
-        menu.addSeparator(); menu.addAction('查看错误日志',lambda:QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(ROOT/'studio_v3.log')))); menu.addAction('安全退出',self.close)
+        menu.addSeparator(); menu.addAction('打开历史记录回放…',self.open_replay); menu.addAction('新建对比窗口…',self.open_compare); menu.addAction('回到真实设备',lambda:self.change_source('RK_TCP')); menu.addAction('模拟演示',lambda:self.change_source('SIMULATED'))
+        menu.addSeparator(); menu.addAction('清除上次回放记忆',self.clear_session); menu.addAction('查看错误日志',lambda:QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(ROOT/'studio_v3.log')))); menu.addAction('安全退出',self.close)
         self.more.setMenu(menu); tools.addWidget(self.more); layout.addLayout(tools)
         view=W.QHBoxLayout(); self.group=W.QComboBox(); self.group.addItems(['肌电 · 9 通道','IMU · 6 通道']); view.addWidget(self.group)
         view.addWidget(W.QLabel('时间窗')); self.span=W.QComboBox(); self.span.addItems(['2','5','10','20']); self.span.setCurrentText('5'); view.addWidget(self.span)
         self.center=W.QCheckBox('显示去直流'); self.center.setChecked(True); view.addWidget(self.center); view.addWidget(W.QLabel('仅影响显示，CSV 保存原始值')); view.addStretch(); self.metrics=W.QLabel(); view.addWidget(self.metrics); layout.addLayout(view)
+        if saved:
+            if str(saved.get('span')) in [self.span.itemText(i) for i in range(self.span.count())]: self.span.setCurrentText(str(saved['span']))
+            try: self.group.setCurrentIndex(int(saved.get('group',0))%self.group.count())
+            except (TypeError,ValueError): pass
+        if getattr(args,'span',None) is not None and self.span.findText(str(args.span))>=0: self.span.setCurrentText(str(args.span))
+        if getattr(args,'group',None) is not None:
+            try: self.group.setCurrentIndex(int(args.group)%self.group.count())
+            except (TypeError,ValueError): pass
         self.info=W.QLabel('等待第一包数据…'); self.info.setWordWrap(True); layout.addWidget(self.info)
+        self._build_label_bar(); layout.addWidget(self.labelbar)
         self.scroll=W.QScrollArea(); self.scroll.setWidgetResizable(True); layout.addWidget(self.scroll,1)
         self.build_plots(); self.group.currentIndexChanged.connect(self.build_plots)
+        self._build_label_panel(); layout.addWidget(self.label_panel)
         self.ruler=W.QLabel(); self.ruler.setStyleSheet('color:#89a3bf;padding-left:135px'); layout.addWidget(self.ruler)
         self.footer=W.QLabel('时间轴为单调显示时间；不代表已验证的硬件同步。'); self.footer.setWordWrap(True); self.footer.setStyleSheet('color:#91a8c3'); layout.addWidget(self.footer)
         self.shortcut=QtGui.QShortcut(QtGui.QKeySequence('F5'),self); self.shortcut.activated.connect(self.toggle_mark)
+        QtGui.QShortcut(QtGui.QKeySequence('Ctrl+S'),self,activated=self.save_label_edits)
+        QtGui.QShortcut(QtGui.QKeySequence.Delete,self.table,activated=self.delete_selected_label)
         self.timer=QtCore.QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(33)
-        self.start_engine('REPLAY' if args.replay else 'SIMULATED' if args.demo else 'RK_TCP',args.replay)
+        source='REPLAY' if self.restore else 'SIMULATED' if demo else 'RK_TCP'
+        self.start_engine(source,self.restore)
+        if self._restore_note: self.flash(self._restore_note,12)
         self.guide=Guide(self)
         guide_button=W.QPushButton('引导采集'); tools.insertWidget(0,guide_button)
         guide_button.clicked.connect(self.guide.show)
 
+    # ---------- label widgets ----------
+    def _build_label_bar(self):
+        self.labelbar=W.QWidget(); row=W.QHBoxLayout(self.labelbar); row.setContentsMargins(3,0,3,0); row.setSpacing(6)
+        head=W.QLabel('动作标签'); head.setFixedWidth(126); head.setStyleSheet('font-size:9pt;color:#c9d7e6'); row.addWidget(head)
+        self.label_plot=pg.PlotWidget(); self.label_plot.setMinimumHeight(52); self.label_plot.setMaximumHeight(52)
+        self.label_plot.setMenuEnabled(False); self.label_plot.setMouseEnabled(x=False,y=False); self.label_plot.hideButtons()
+        self.label_plot.hideAxis('left'); self.label_plot.hideAxis('bottom'); self.label_plot.setYRange(0,1,padding=0)
+        self._label_regions=[]; self._label_texts=[]
+        for _ in range(MAX_LABEL_SPANS):
+            region=pg.LinearRegionItem(values=(0,0),orientation='vertical',brush=pg.mkBrush(255,255,255,20),pen=pg.mkPen('#ffffff'),movable=False)
+            region.setZValue(5); region.hide(); region._label_index=None
+            region.sigRegionChangeFinished.connect(lambda r=region:self._on_region_finished(r))
+            self.label_plot.addItem(region); self._label_regions.append(region)
+            text=pg.TextItem('',anchor=(0.5,0.5)); text.setZValue(6); text.hide(); self.label_plot.addItem(text); self._label_texts.append(text)
+        self.label_plot.scene().sigMouseClicked.connect(self._on_label_click)
+        row.addWidget(self.label_plot,1)
+    def _build_label_panel(self):
+        self.label_panel=W.QWidget(); box=W.QVBoxLayout(self.label_panel); box.setContentsMargins(0,0,0,2); box.setSpacing(4)
+        head=W.QHBoxLayout(); self.label_title=W.QLabel('动作标签'); self.label_title.setStyleSheet('color:#53d9c0;font-weight:600')
+        self.label_hint=W.QLabel(''); self.label_hint.setStyleSheet('color:#8fa5bf'); self.label_hint.setSizePolicy(W.QSizePolicy.Ignored,W.QSizePolicy.Preferred); self.label_hint.setMinimumWidth(0)
+        head.addWidget(self.label_title); head.addWidget(self.label_hint,1)
+        self.pause_replay=W.QPushButton('暂停回放'); self.pause_replay.setCheckable(True); self.pause_replay.toggled.connect(self._toggle_pause_replay)
+        self.edit_labels=W.QCheckBox('编辑标签'); self.edit_labels.toggled.connect(self._toggle_label_edit)
+        head.addWidget(self.pause_replay); head.addWidget(self.edit_labels); box.addLayout(head)
+        self.table=W.QTableWidget(0,6); self.table.setHorizontalHeaderLabels(['#','开始 s','结束 s','时长 s','类别','来源'])
+        self.table.verticalHeader().setVisible(False); self.table.setSelectionBehavior(W.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(W.QAbstractItemView.SingleSelection); self.table.setEditTriggers(W.QAbstractItemView.NoEditTriggers)
+        header=self.table.horizontalHeader(); header.setStretchLastSection(False)
+        header.setSectionResizeMode(4,W.QHeaderView.Stretch); header.setSectionResizeMode(5,W.QHeaderView.ResizeToContents)
+        self.table.setMinimumHeight(72); self.table.setMaximumHeight(150)
+        for column,width in ((0,34),(1,70),(2,70),(3,64),(4,190)): self.table.setColumnWidth(column,width)
+        self.table.itemSelectionChanged.connect(self._on_label_selection); self.table.itemChanged.connect(self._on_label_item_changed)
+        box.addWidget(self.table)
+        row=W.QHBoxLayout(); self.add_label_button=W.QPushButton('新建区间'); self.add_label_button.clicked.connect(self.add_label_at_view)
+        self.del_label_button=W.QPushButton('删除选中'); self.del_label_button.clicked.connect(self.delete_selected_label)
+        self.save_labels_button=W.QPushButton('保存标签'); self.save_labels_button.clicked.connect(self.save_label_edits)
+        self.reload_labels_button=W.QPushButton('重新载入'); self.reload_labels_button.clicked.connect(self.reload_labels)
+        for button in (self.add_label_button,self.del_label_button,self.save_labels_button,self.reload_labels_button): row.addWidget(button)
+        row.addStretch(); self.label_tip=W.QLabel('拖动色块边界改时间 · 双击标签条空白新建 · Ctrl+S 保存')
+        self.label_tip.setStyleSheet('color:#8fa5bf'); self.label_tip.setSizePolicy(W.QSizePolicy.Ignored,W.QSizePolicy.Preferred); self.label_tip.setMinimumWidth(0)
+        row.addWidget(self.label_tip)
+        box.addLayout(row)
+        self.labelbar.setVisible(False); self.label_panel.setVisible(False)
+    def _load_labels(self,folder):
+        self._label_dirty=False; self._selected_label_index=None
+        if folder:
+            try: self.labels,self.label_info=replay_labels.load(folder)
+            except Exception as exc:
+                LOG.exception('label load failed'); self.labels=[]; self.label_info={'warnings':['读取动作标签失败：'+str(exc)],'n':0,'truth':None}
+        else: self.labels=[]; self.label_info={}
+        self._refresh_label_table(); self._update_label_header()
+        warnings=self.label_info.get('warnings') or []
+        if warnings: self.flash(warnings[0],10)
+        self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
+    def _refresh_label_table(self):
+        self._syncing_table=True
+        try:
+            self.table.setRowCount(len(self.labels))
+            for row,item in enumerate(self.labels):
+                color=QtGui.QColor(replay_labels.color_for(item['label']))
+                source={'manual':'手打','guide':'引导'}.get(item.get('source'),'编辑')
+                values=[str(row+1),f"{item['start']:.2f}",f"{item['end']:.2f}",f"{item['end']-item['start']:.2f}",item['label'],source]
+                for column,text in enumerate(values):
+                    cell=self.table.item(row,column)
+                    if cell is None: cell=W.QTableWidgetItem(); self.table.setItem(row,column,cell)
+                    cell.setText(text)
+                    flags=QtCore.Qt.ItemIsEnabled|QtCore.Qt.ItemIsSelectable
+                    if column==4: flags|=QtCore.Qt.ItemIsEditable
+                    cell.setFlags(flags)
+                    cell.setForeground(color if column in (4,5) else QtGui.QBrush(QtGui.QColor('#deebf7')))
+                self.table.setRowHeight(row,20)
+        finally: self._syncing_table=False
+    def _update_label_header(self):
+        if not self.label_info:
+            self.label_title.setText('动作标签'); self.label_hint.setText(''); return
+        truth='events.edited.csv（编辑后真值）' if self.label_info.get('edited') else 'events.csv（原始）'
+        self.label_title.setText(f"动作标签 {len(self.labels)} 段 · {truth}"+(' · 未保存*' if self._label_dirty else ''))
+        counts={}
+        for item in self.labels: counts[item['label']]=counts.get(item['label'],0)+1
+        parts='  '.join(f'{name}×{count}' for name,count in sorted(counts.items()))
+        self.label_hint.setText(('类别：'+parts+'   ' if parts else '')+'来源：手打=events start/end；引导=guide JSON phase 1')
+    def _sync_labels(self,end,span,force=False):
+        if not self.labelbar.isVisible(): return
+        if self._label_static and not force: return
+        visible=[]
+        for index,item in enumerate(self.labels):
+            if item['end']>end-span-.001 and item['start']<end+.001: visible.append((index,item))
+        self._syncing_labels=True
+        try:
+            for slot,region in enumerate(self._label_regions):
+                text=self._label_texts[slot]
+                if slot>=len(visible):
+                    region.hide(); text.hide(); region._label_index=None; continue
+                index,item=visible[slot]; color=replay_labels.color_for(item['label'])
+                left=max(item['start']-end,-span); right=min(item['end']-end,0.0)
+                region.setRegion((left,right)); brush=QtGui.QColor(color); brush.setAlpha(70)
+                region.setBrush(pg.mkBrush(brush))
+                pen=pg.mkPen(color,width=2 if index==self._selected_label_index else 1)
+                for edge in region.lines: edge.setPen(pen)
+                region.setMovable(self._label_static); region.show(); region._label_index=index; region._sync_end=end
+                text.setText(item['label']); text.setColor(color); text.setPos((left+right)/2,.5)
+                text.setVisible((right-left)>span*.06)
+        finally: self._syncing_labels=False
+        self._sync_channel_labels(visible,end,span)
+    def _sync_channel_labels(self,visible,end,span):
+        for lines in getattr(self,'label_lines',[]):
+            used=min(len(visible),len(lines)//2)
+            for slot in range(len(lines)//2):
+                if slot>=used:
+                    lines[2*slot].hide(); lines[2*slot+1].hide(); continue
+                index,item=visible[slot]; color=replay_labels.color_for(item['label'])
+                for line,value in ((lines[2*slot],item['start']-end),(lines[2*slot+1],item['end']-end)):
+                    line.setPen(pg.mkPen(color,width=1,style=QtCore.Qt.DashLine)); line.setPos(max(-span,min(0.,value))); line.show()
+    def _on_label_click(self,event):
+        if not self.labelbar.isVisible() or not event.double(): return
+        if not self._label_static:
+            self.edit_labels.setChecked(True)
+            if not self._label_static: return
+        self._create_label_at(self.label_plot.getViewBox().mapSceneToView(event.scenePos()).x()+self._label_end)
+    def _on_region_finished(self,region):
+        if not self._label_static or getattr(self,'_syncing_labels',False): return
+        index=getattr(region,'_label_index',None)
+        if index is None or index>=len(self.labels): return
+        left,right=region.getRegion(); end=getattr(region,'_sync_end',self._label_end)
+        start=max(0.,min(left,right)+end); stop=max(left,right)+end
+        total=self.label_info.get('total_s')
+        if total: stop=min(stop,float(total))
+        if stop-start<.05: self.flash('区间太短（<50 ms），已恢复原值'); self._sync_labels(end,float(self.span.currentText()),force=True); return
+        self.labels[index]['start']=start; self.labels[index]['end']=stop; self._label_dirty=True
+        self._refresh_label_table()
+        self._syncing_table=True
+        try:
+            self.table.selectRow(index); self._selected_label_index=index
+        finally: self._syncing_table=False
+        self._update_label_header(); self.flash(f"已移动区间：{self.labels[index]['label']} {start:.2f}–{stop:.2f}s（未保存）")
+    def _on_label_selection(self):
+        if self._syncing_table: return
+        self._selected_label_index=self.table.currentRow() if self.table.currentRow()>=0 else None
+        if not self._label_static: self._sync_labels(self._label_end,float(self.span.currentText()))
+    def _on_label_item_changed(self,cell):
+        if self._syncing_table or cell.column()!=4: return
+        row=cell.row()
+        if row<0 or row>=len(self.labels): return
+        label=cell.text().strip() or self.labels[row]['label']
+        if label==self.labels[row]['label']: return
+        self.labels[row]['label']=label; self._label_dirty=True
+        self._syncing_table=True
+        try: cell.setForeground(QtGui.QBrush(QtGui.QColor(replay_labels.color_for(label))))
+        finally: self._syncing_table=False
+        self._update_label_header(); self.flash(f'已改类别：{label}（未保存）')
+    def _create_label_at(self,when):
+        label=self.label.currentText().strip() or 'unlabeled'; total=self.label_info.get('total_s')
+        start=max(0.,when-.5); stop=when+.5
+        if total: stop=min(stop,float(total)); start=min(start,max(0.,float(total)-.1))
+        if stop-start<.1: self.flash('此处无法新建区间（超出记录时间轴）'); return
+        self.labels.append(dict(label=label,start=start,end=stop,source='edited'))
+        self.labels.sort(key=lambda item:(item['start'],item['end'],item['label']))
+        self._label_dirty=True; self._refresh_label_table(); self._update_label_header()
+        self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
+        index=next(i for i,item in enumerate(self.labels) if item['start']==start and item['label']==label)
+        self.table.selectRow(index); self._selected_label_index=index
+        self.flash(f'已新建区间 {label} {start:.2f}–{stop:.2f}s（未保存，Ctrl+S 保存）')
+    def add_label_at_view(self):
+        if not self.labelbar.isVisible(): self.flash('只有回放视图可以编辑标签'); return
+        if not self._label_static: self.edit_labels.setChecked(True)
+        if not self._label_static: return
+        self._create_label_at(self._label_end-float(self.span.currentText())/2)
+    def delete_selected_label(self):
+        row=self.table.currentRow()
+        if row<0 or row>=len(self.labels): self.flash('先在下方清单里选中一行，再删除'); return
+        removed=self.labels.pop(row); self._label_dirty=True; self._selected_label_index=None
+        self._refresh_label_table(); self._update_label_header()
+        self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
+        self.flash(f"已删除区间 {removed['label']} {removed['start']:.2f}–{removed['end']:.2f}s（未保存）")
+    def _toggle_label_edit(self,checked):
+        if self._edit_guard: return
+        self._edit_guard=True
+        timer=getattr(self,'_freeze_edit_timer',None)
+        try:
+            if checked:
+                if not self.labelbar.isVisible():
+                    self.flash('只有回放视图可以编辑标签'); self.edit_labels.setChecked(False); return
+                self._paused_before_edit=self.pause_replay.isChecked()
+                self.pause_replay.setChecked(True)
+                if self.engine: self.engine.pause.set()
+                self.table.setEditTriggers(W.QAbstractItemView.DoubleClicked|W.QAbstractItemView.EditKeyPressed)
+                # The replay thread may deliver one more block after the pause request; wait
+                # for the display clock to settle before freezing the label geometry.
+                self._label_static=False
+                for region in self._label_regions: region.setMovable(False)
+                timer=QtCore.QTimer(self); timer.setSingleShot(True); timer.timeout.connect(self._freeze_labels_for_edit)
+                self._freeze_edit_timer=timer; timer.start(300)
+                self.flash('编辑模式：正在暂停回放…')
+            else:
+                if timer: timer.stop()
+                self._label_static=False
+                for region in self._label_regions: region.setMovable(False)
+                self.table.setEditTriggers(W.QAbstractItemView.NoEditTriggers)
+                if not self._paused_before_edit:
+                    self.pause_replay.setChecked(False)
+                    if self.engine: self.engine.pause.clear()
+                self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
+        finally: self._edit_guard=False
+    def _freeze_labels_for_edit(self):
+        if not self.edit_labels.isChecked(): return
+        self._label_static=True
+        for region in self._label_regions: region.setMovable(True)
+        self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
+        self.flash('编辑模式：回放已暂停。拖动色块边界改时间，双击空白处新建，改完点“保存标签”。')
+    def _toggle_pause_replay(self,checked):
+        if self._edit_guard: return
+        engine=getattr(self,'engine',None)
+        if engine:
+            if checked: engine.pause.set()
+            else:
+                if self.edit_labels.isChecked():
+                    self._edit_guard=True
+                    try: self.pause_replay.setChecked(True)
+                    finally: self._edit_guard=False
+                    self.flash('编辑标签时回放保持暂停；先取消“编辑标签”再继续回放'); return
+                engine.pause.clear()
+        self.flash('回放已暂停：时间轴静止，可编辑标签' if checked else '回放继续')
+    def save_label_edits(self):
+        if not self.labelbar.isVisible(): self.flash('只有回放视图有标签可保存'); return
+        folder=getattr(self.engine,'replay',None)
+        if not folder: self.flash('当前不是回放，没有可保存的标签'); return
+        if not self._label_dirty:
+            self.flash('没有未保存的修改'); return
+        try: edited,backup=replay_labels.save(folder,self.labels)
+        except Exception as exc:
+            LOG.exception('label save failed'); self.flash('保存标签失败：'+str(exc),12); return
+        self.labels,self.label_info=replay_labels.load(folder)
+        self._label_dirty=False; self._selected_label_index=None
+        self._refresh_label_table(); self._update_label_header()
+        self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
+        self.flash(f'已保存标签 → {edited.name}（真值）'+ (f'；原 events.csv 备份 → {backup.name}' if backup else ''),14)
+    def reload_labels(self):
+        folder=getattr(self.engine,'replay',None)
+        if not folder: return
+        self._load_labels(folder); self.flash('已重新载入标签')
+    def clear_session(self):
+        self._forget_session(); self.flash('已清除上次回放记忆')
+    def _forget_session(self):
+        if not self._allow_persist_write: return
+        data=self._load_session(); data['replay']=None; data.pop('source',None)
+        try:
+            path=settings_path(); path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+        except OSError: LOG.exception('session forget failed')
+    # ---------- main view ----------
     def build_plots(self,*unused):
         old=self.scroll.takeWidget()
         if old: old.deleteLater()
         content=W.QWidget(); lay=W.QVBoxLayout(content); lay.setContentsMargins(0,0,0,0); lay.setSpacing(3)
-        self.curves=[]; self.plots=[]; self.channel_labels=[]; self.guides=[]; self.kind=16 if self.group.currentIndex()==0 else 17
+        self.curves=[]; self.plots=[]; self.channel_labels=[]; self.guides=[]; self.label_lines=[]; self.kind=16 if self.group.currentIndex()==0 else 17
         for i,name in enumerate(NAMES[self.kind]):
             frame=W.QWidget(); row=W.QHBoxLayout(frame); row.setContentsMargins(3,0,3,0)
             label=W.QLabel(name); label.setFixedWidth(126); label.setStyleSheet('font-size:9pt;color:'+COLORS[i]); label.setSizePolicy(W.QSizePolicy.Fixed,W.QSizePolicy.Ignored); row.addWidget(label)
@@ -62,11 +355,27 @@ class Window(W.QMainWindow):
             for j in range(6):
                 line=pg.InfiniteLine(angle=90,pen=pg.mkPen('#24384d')); plot.addItem(line); guides.append(line)
             plot.addItem(pg.InfiniteLine(pos=0,angle=0,pen=pg.mkPen('#344b63'))); self.guides.append(guides)
+            lines=[]
+            for _ in range(MAX_LABEL_SPANS*2):
+                line=pg.InfiniteLine(angle=90,movable=False,pen=pg.mkPen('#ffffff')); line.setZValue(4); line.hide(); plot.addItem(line); lines.append(line)
+            self.label_lines.append(lines)
             curve=plot.plot(pen=pg.mkPen(COLORS[i],width=1),connect='finite'); curve.setClipToView(True); curve.setDownsampling(auto=True,method='peak')
             row.addWidget(plot,1); lay.addWidget(frame,1); self.curves.append(curve); self.plots.append(plot); self.channel_labels.append(label)
         self.scroll.setWidget(content)
+        self._sync_labels(self._label_end,float(self.span.currentText()),force=True)
     def start_engine(self,source,replay=None):
-        self.engine=Engine(port=self.config['port'],rates={16:self.config['emg'],17:self.config['imu']},source=source,replay=replay); self.engine.start(); self.freeze.setChecked(False)
+        self.engine=Engine(port=self.config['port'],rates={16:self.config['emg'],17:self.config['imu']},source=source,replay=replay)
+        is_replay=source=='REPLAY'
+        self.labelbar.setVisible(is_replay); self.label_panel.setVisible(is_replay)
+        self.pause_replay.setEnabled(is_replay); self.edit_labels.setEnabled(is_replay)
+        self.save_labels_button.setEnabled(is_replay); self.add_label_button.setEnabled(is_replay)
+        self.del_label_button.setEnabled(is_replay); self.reload_labels_button.setEnabled(is_replay)
+        if not is_replay and self.edit_labels.isChecked(): self.edit_labels.setChecked(False)
+        if self.freeze.isChecked(): self.freeze.setChecked(False)
+        self._load_labels(replay if is_replay else None)
+        self.engine.start()
+        if self.pause_replay.isChecked(): self.engine.pause.set()
+        if is_replay and self._allow_persist_write and replay: self._save_session(source,replay)
     def change_source(self,source,replay=None):
         if self.engine.recorder or any(w.thread.is_alive() for w in self.engine.writers):
             W.QMessageBox.information(self,'先结束保存','先停止保存，等待文件写完，再切换数据源。'); return
@@ -91,6 +400,23 @@ class Window(W.QMainWindow):
     def open_replay(self):
         folder=W.QFileDialog.getExistingDirectory(self,'选择含 metadata.json 的历史目录',self.config['output'])
         if folder: self.change_source('REPLAY',folder)
+    def open_compare(self):
+        folder=getattr(self.engine,'replay',None)
+        if self.engine.source!='REPLAY' or not folder:
+            W.QMessageBox.information(self,'需要回放','先打开一个历史记录回放，再开对比窗口。'); return
+        groups=['肌电 · 9 通道','IMU · 6 通道']
+        choice,ok=W.QInputDialog.getItem(self,'新建对比窗口','新窗口显示的通道组：',groups,0,False)
+        if not ok: return
+        spans=[self.span.itemText(i) for i in range(self.span.count())]
+        span,ok=W.QInputDialog.getItem(self,'新建对比窗口','新窗口时间窗（秒）：',spans,2,False)
+        if not ok: return
+        command=[sys.executable,str(ROOT/'studio_qt.py'),'--replay',str(folder),'--compare','--group',str(groups.index(choice)),'--span',span]
+        try:
+            with open(ROOT/'compare_windows.log','a',encoding='utf-8') as log:
+                subprocess.Popen(command,cwd=str(ROOT),stdout=log,stderr=log,close_fds=True)
+            self.flash(f'已启动对比窗口：{choice} · {span}s 时间窗（独立进程，可再开一个）',10)
+        except Exception as exc:
+            LOG.exception('compare window failed'); W.QMessageBox.warning(self,'无法启动对比窗口',str(exc))
     def toggle_record(self):
         if self.guide.active:
             self.guide.finish('user_stop'); return
@@ -100,6 +426,9 @@ class Window(W.QMainWindow):
         except Exception as exc: W.QMessageBox.warning(self,'无法保存',str(exc)); LOG.exception('record toggle failed')
     def toggle_mark(self):
         if not self.guide.active: self.engine.mark(self.label.currentText())
+    def flash(self,text,seconds=8):
+        self._flash_text=text; self._flash_until=time.monotonic()+seconds
+        if hasattr(self,'footer'): self.footer.setText(text)
     def tick(self):
         started=time.perf_counter()
         try:
@@ -122,7 +451,8 @@ class Window(W.QMainWindow):
                 for k,q in recent.items():
                     q=[r for r in q if r[0]>now-3]
                     rates[k]=sum(n for _,n in q[1:])/(q[-1][0]-q[0][0]) if len(q)>1 and q[-1][0]>q[0][0] else 0
-                self.info.setText(f'{e.status}  |  EMG {counts[16]:,} · {rates[16]:.0f} 点/s    IMU {counts[17]:,} · {rates[17]:.0f} 点/s  |  协议异常 {errors}  时间调整 {adjust}（非丢包计数）')
+                paused_replay=e.source=='REPLAY' and self.pause_replay.isChecked()
+                self.info.setText(f'{e.status}{" · 已暂停" if paused_replay else ""}  |  EMG {counts[16]:,} · {rates[16]:.0f} 点/s    IMU {counts[17]:,} · {rates[17]:.0f} 点/s  |  协议异常 {errors}  时间调整 {adjust}（非丢包计数）')
                 span=float(self.span.currentText())
                 if not self.freeze.isChecked(): self.ruler.setText('距最新数据：  '+'     │     '.join(f'−{span*(1-i/5):g}s' if i<5 else '最新' for i in range(6))+f'      显示时刻 {e.latest:.2f}s')
                 saving=any(w.thread.is_alive() for w in e.writers) and not rec
@@ -130,9 +460,12 @@ class Window(W.QMainWindow):
                 self.record.setEnabled(bool(rec) or (not saving and e.source!='REPLAY' and e.connected and age<2))
                 self.mark.setEnabled(bool(rec)); self.mark.setText('结束动作  F5' if e.label else '标记动作  F5'); self.label.setEnabled(not bool(e.label))
                 problem=e.record_fault or next((w.error for w in e.writers if w.error),None)
-                if problem: self.footer.setText('保存错误（记录不完整）：'+problem)
+                if now<self._flash_until: self.footer.setText(self._flash_text)
+                elif problem: self.footer.setText('保存错误（记录不完整）：'+problem)
                 elif e.writers and not e.writers[-1].thread.is_alive(): self.footer.setText('已保存：'+str(e.writers[-1].path))
                 elif rec: self.footer.setText('正在保存原始样本：'+str(rec.path))
+                elif paused_replay: self.footer.setText('回放已暂停：时间轴静止，可编辑标签；取消“编辑标签”后点“继续回放”。')
+                elif e.source=='REPLAY': self.footer.setText('历史回放：时间轴按记录文件重建，不是已验证的硬件同步。标签真值见 events.edited.csv（若存在）。')
                 else: self.footer.setText('暂停显示不停止接收；显示去直流不改变原始文件。时间轴为显示估算。')
             if not self.freeze.isChecked(): self.render_frame()
             self.frame_times.append((time.perf_counter()-started)*1000); self.frame_times=self.frame_times[-120:]
@@ -143,6 +476,9 @@ class Window(W.QMainWindow):
                 self.last_error=time.monotonic(); LOG.exception('UI refresh failed; timer remains active'); self.footer.setText('显示异常，正在重试；接收线程独立。详情见 studio_v3.log')
     def render_frame(self):
         span=float(self.span.currentText()); x,y,end=self.engine.snapshot(span,self.kind)
+        self._label_end=end
+        self.label_plot.setXRange(-span,0,padding=0)
+        self._sync_labels(end,span)
         if not len(x): return
         viewport=self.scroll.viewport().rect()
         for c,(plot,curve,label) in enumerate(zip(self.plots,self.curves,self.channel_labels)):
@@ -157,7 +493,24 @@ class Window(W.QMainWindow):
             stale=time.monotonic()-self.engine.last_by_kind[self.kind]>2
             flag='无新数据' if stale else '平线 · 检查接触' if np.ptp(finite)==0 else '接近 int16 边界' if np.any(np.abs(finite)>=32760) else ''
             label.setText(f'{NAMES[self.kind][c]}'+(' · '+flag if flag else '')+f'\n{int(finite.min())}…{int(finite.max())}'); label.setToolTip('原始值范围；各通道独立自动缩放。'+('显示已去直流。' if self.center.isChecked() else '')+flag)
+    # ---------- session memory ----------
+    def _load_session(self):
+        try: return json.loads(settings_path().read_text(encoding='utf-8'))
+        except (OSError,ValueError): return {}
+    def _save_session(self,source=None,replay=None):
+        if not self._allow_persist_write: return
+        engine=getattr(self,'engine',None)
+        source=source or (engine.source if engine else 'RK_TCP')
+        replay=replay if replay is not None else (engine.replay if engine else None)
+        data=dict(source=source,replay=(str(replay) if source=='REPLAY' and replay else None),
+                  span=self.span.currentText(),group=self.group.currentIndex(),
+                  last_timeline=round(float(engine.latest),3) if engine else 0.,saved_unix_ns=time.time_ns())
+        try:
+            path=settings_path(); path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+        except OSError: LOG.exception('session save failed')
     def closeEvent(self,event):
+        self._save_session()
         self.guide.finish('application_closed')
         if not self.closing:
             self.closing=True; self.engine.shutdown(); self.record.setEnabled(False); self.more.setEnabled(False)
@@ -165,7 +518,10 @@ class Window(W.QMainWindow):
         else: self.timer.stop(); event.accept()
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument('--demo',action='store_true'); parser.add_argument('--replay'); parser.add_argument('--port',type=int); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument('--demo',action='store_true'); parser.add_argument('--replay')
+    parser.add_argument('--port',type=int); parser.add_argument('--group',type=int,choices=(0,1)); parser.add_argument('--span',choices=('2','5','10','20'))
+    parser.add_argument('--compare',action='store_true',help='第二/第三对比窗口：不读取也不写入工作区记忆')
+    args=parser.parse_args()
     handler=RotatingFileHandler(ROOT/'studio_v3.log',maxBytes=2_000_000,backupCount=3,encoding='utf-8'); logging.basicConfig(level=logging.INFO,handlers=[handler],format='%(asctime)s %(levelname)s %(message)s')
     app=W.QApplication(sys.argv); app.setStyle('Fusion')
     sys.excepthook=lambda kind,value,tb:LOG.error('Unhandled callback',exc_info=(kind,value,tb))
